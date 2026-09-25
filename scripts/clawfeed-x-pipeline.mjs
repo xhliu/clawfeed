@@ -35,6 +35,7 @@ function parseArgs(argv) {
     else if (a === '--no-popular-refresh') args.popularRefresh = false;
     else if (a === '--popular-refresh-min-faves') args.popularRefreshMinFaves = Number(argv[++i]);
     else if (a === '--popular-refresh-pages') args.popularRefreshPages = Number(argv[++i]);
+    else if (a === '--exclude-active-source') args.excludeActiveSource = true;
     else if (a === '--sync-following-pages') args.syncFollowingPages = Number(argv[++i]);
     else if (a === '--file') args.file = argv[++i];
     else if (a === '--json') args.json = true;
@@ -45,7 +46,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`Usage: scripts/clawfeed-x-pipeline.mjs <fetch|fetch-following|sync-following|candidates|popular|insert|run|run-following|run-following-popular> [options]\n\nCommands:\n  fetch            Fetch X Home timeline via the logged-in OpenClaw browser session and store raw_items\n  fetch-following  Fetch latest tweets from all followed accounts via X search filter:follows\n  sync-following   Best-effort sync of ClawFeed twitter_feed sources to the logged-in X account's current Following list\n  candidates       Print recent high-signal raw_items for a digest\n  insert           Insert a digest from stdin or --file into ClawFeed\n  run              Fetch Home timeline + print candidates (cron/agent composes the digest)\n  run-following    Fetch all-following timeline + print candidates\n  run-following-popular  Fetch live all-following tweets, then rank only rows refreshed by this run\n\nOptions:\n  --pages N       X API pages to fetch (default fetch/run: 6, following: 300)\n  --limit N       Candidate count (default: 40)\n  --hours N       Candidate lookback/fetch stop hours (default: 30)\n  --query Q       X search query for fetch-following (default: filter:follows)\n  --slice-minutes N  Time-slice width for exhaustive following search (default: 10)\n  --min-slice-minutes N  Smallest adaptive split window when a slice is still full (default: 1)\n  --pages-per-slice N  Search pages per time slice (default: 2)\n  --batch-hours N  Browser-evaluate batch size in hours (default: 1)\n  --candidate-hours N  Candidate lookback for run/run-following (default: --hours)\n  --sync-following-pages N  Page budget for manual current-following sync (default: 120)\n  --no-popular-refresh  Disable the min_faves backfill used by run-following-popular\n  --popular-refresh-min-faves N  Backfill threshold for viral posts that grew after initial ingest (default: 100)\n  --popular-refresh-pages N  Page budget for the popular backfill (default: 2 pages per candidate hour, min 60)\n  --db PATH       SQLite DB path\n  --user-slug S   ClawFeed user slug (default: kevin)\n  --file PATH     Digest file for insert\n  --json          JSON output where supported`);
+  console.log(`Usage: scripts/clawfeed-x-pipeline.mjs <fetch|fetch-following|sync-following|candidates|popular|insert|run|run-following|run-following-popular> [options]\n\nCommands:\n  fetch            Fetch X Home timeline via the logged-in OpenClaw browser session and store raw_items\n  fetch-following  Fetch latest tweets from all followed accounts via X search filter:follows\n  sync-following   Best-effort sync of ClawFeed twitter_feed sources to the logged-in X account's current Following list\n  candidates       Print recent high-signal raw_items for a digest\n  insert           Insert a digest from stdin or --file into ClawFeed\n  run              Fetch Home timeline + print candidates (cron/agent composes the digest)\n  run-following    Fetch all-following timeline + print candidates\n  run-following-popular  Fetch live all-following tweets, then rank only rows refreshed by this run\n\nOptions:\n  --pages N       X API pages to fetch (default fetch/run: 6, following: 300)\n  --limit N       Candidate count (default: 40)\n  --hours N       Candidate lookback/fetch stop hours (default: 30)\n  --query Q       X search query for fetch-following (default: filter:follows)\n  --slice-minutes N  Time-slice width for exhaustive following search (default: 10)\n  --min-slice-minutes N  Smallest adaptive split window when a slice is still full (default: 1)\n  --pages-per-slice N  Search pages per time slice (default: 2)\n  --batch-hours N  Browser-evaluate batch size in hours (default: 1)\n  --candidate-hours N  Candidate lookback for run/run-following (default: --hours)\n  --sync-following-pages N  Page budget for manual current-following sync (default: 120)\n  --no-popular-refresh  Disable the min_faves backfill used by run-following-popular\n  --popular-refresh-min-faves N  Backfill threshold for viral posts that grew after initial ingest (default: 100)\n  --popular-refresh-pages N  Page budget for the popular backfill (default: 2 pages per candidate hour, min 60)\n  --exclude-active-source  Exclude posts from active twitter_feed subscriptions when ranking popular rows\n  --db PATH       SQLite DB path\n  --user-slug S   ClawFeed user slug (default: kevin)\n  --file PATH     Digest file for insert\n  --json          JSON output where supported`);
 }
 
 function getDb(dbPath = DEFAULT_DB) {
@@ -1123,13 +1124,13 @@ function candidateRows({ dbPath, userSlug, limit = 40, hours = 30 }) {
   return { ok: true, count: ranked.length, generatedAt: new Date().toISOString(), candidates: ranked };
 }
 
-function popularRows({ dbPath, userSlug, limit = 10, hours = 30, fetchedSince = null, requireActiveSource = true }) {
+function popularRows({ dbPath, userSlug, limit = 10, hours = 30, fetchedSince = null, requireActiveSource = true, excludeActiveSource = false }) {
   const db = getDb(dbPath);
   const user = getUser(db, userSlug);
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
+  const shouldRequireActiveSource = requireActiveSource && !excludeActiveSource;
   const fetchedSinceFilter = fetchedSince ? 'AND datetime(r.fetched_at) >= datetime(?)' : '';
-  const activeSourceFilter = requireActiveSource ? `
-        AND EXISTS (
+  const activeSourceExists = `EXISTS (
           SELECT 1
           FROM sources s
           JOIN user_subscriptions us ON us.source_id = s.id
@@ -1145,10 +1146,13 @@ function popularRows({ dbPath, userSlug, limit = 10, hours = 30, fetchedSince = 
                 ELSE '@' || COALESCE(json_extract(s.config, '$.handle'), s.name)
               END
             ) = lower(r.author_handle)
-        )` : '';
+        )`;
+  const activeSourceFilter = shouldRequireActiveSource
+    ? `AND ${activeSourceExists}`
+    : (excludeActiveSource ? `AND NOT ${activeSourceExists}` : '');
   const params = [`-${Number(hours) || 30} hours`];
   if (fetchedSince) params.push(fetchedSince);
-  if (requireActiveSource) params.push(user.id);
+  if (shouldRequireActiveSource || excludeActiveSource) params.push(user.id);
   params.push(Number(limit) || 10);
   const rows = db.prepare(`
     WITH ranked AS (
@@ -1212,10 +1216,12 @@ function popularRows({ dbPath, userSlug, limit = 10, hours = 30, fetchedSince = 
     ORDER BY likes DESC, views DESC
     LIMIT ?
   `).all(...params);
-  const ranking = requireActiveSource
+  const ranking = shouldRequireActiveSource
     ? 'current active local sources only; one tweet per author; likes descending'
-    : 'current live filter:follows run only; one tweet per author; likes descending';
-  return { ok: true, count: rows.length, generatedAt: new Date().toISOString(), hours: Number(hours) || 30, fetchedSince, ranking, items: rows };
+    : (excludeActiveSource
+      ? 'current live search run only; excluding active local sources; one tweet per author; likes descending'
+      : 'current live search run only; one tweet per author; likes descending');
+  return { ok: true, count: rows.length, generatedAt: new Date().toISOString(), hours: Number(hours) || 30, fetchedSince, requireActiveSource: shouldRequireActiveSource, excludeActiveSource, ranking, items: rows };
 }
 
 function safeJson(s) { try { return JSON.parse(s || '{}'); } catch { return {}; } }
@@ -1318,7 +1324,7 @@ try {
   } else if (cmd === 'candidates') {
     printCandidates(candidateRows({ ...common, limit: args.limit || 40, hours: args.candidateHours || args.hours || 30 }), args.json);
   } else if (cmd === 'popular') {
-    printPopular(popularRows({ ...common, limit: args.limit || 10, hours: args.candidateHours || args.hours || 30 }), args.json);
+    printPopular(popularRows({ ...common, limit: args.limit || 10, hours: args.candidateHours || args.hours || 30, excludeActiveSource: Boolean(args.excludeActiveSource) }), args.json);
   } else if (cmd === 'insert') {
     console.log(JSON.stringify(insertDigest({ ...common, file: args.file }), null, 2));
   } else if (cmd === 'run') {
@@ -1365,7 +1371,8 @@ try {
       limit: args.limit || 10,
       hours: candidateHours,
       fetchedSince: popularRefreshFailed ? null : runStartedAt,
-      requireActiveSource: popularRefreshFailed,
+      requireActiveSource: popularRefreshFailed && !args.excludeActiveSource,
+      excludeActiveSource: Boolean(args.excludeActiveSource),
     });
     if (popularRefreshFailed) {
       popular.fallback = 'stored all-following rows after popular refresh failure';
