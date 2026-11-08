@@ -129,60 +129,70 @@ function isTransientBrowserError(err) {
     .test(summarizeError(err));
 }
 
-function startBrowserSession() {
-  const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
-  const profileArgs = browserProfile ? ['--browser-profile', browserProfile] : [];
-  try {
-    execFileSync('openclaw', ['browser', ...profileArgs, 'start', '--headless'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'ignore', 'pipe'],
-      timeout: 45000,
-    });
-  } catch {}
-}
+// The browser profile is shared with other live agents (Reddit tabs, research loops),
+// and two crons can run at once. Never touch their tabs and never stop/restart the
+// shared browser: each process opens its own labeled tab, evaluates only with an
+// explicit --target-id, waits for the page to settle, and closes the tab on exit.
+let ownXTab = null;
+const OWN_TAB_LABEL = `clawfeed-x-${process.pid}`;
 
-function stopBrowserSession() {
-  const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
-  const profileArgs = browserProfile ? ['--browser-profile', browserProfile] : [];
-  try {
-    execFileSync('openclaw', ['browser', ...profileArgs, 'stop'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'ignore', 'pipe'],
-      timeout: 45000,
-    });
-  } catch {}
-}
+function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
 
-function restartBrowserSession() {
-  stopBrowserSession();
-  startBrowserSession();
+function closeOwnXTab() {
+  if (!ownXTab) return;
+  const id = ownXTab;
+  ownXTab = null;
+  try { runOpenClawBrowser(['close', id], { timeoutMs: 20000 }); } catch {}
 }
+process.on('exit', closeOwnXTab);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { closeOwnXTab(); process.exit(130); });
 
-function focusXTab() {
-  let tabs;
-  try { tabs = runOpenClawBrowser(['tabs'], { timeoutMs: 30000 }).tabs || []; } catch { tabs = []; }
-  const page = tabs.find(t => t.type === 'page' && /^https:\/\/x\.com\//.test(t.url || '')) ||
-    tabs.find(t => t.type === 'page' && /^https:\/\/twitter\.com\//.test(t.url || ''));
-  if (page) {
-    runOpenClawBrowser(['focus', page.suggestedTargetId || page.tabId || page.targetId], { timeoutMs: 30000 });
-    return page.suggestedTargetId || page.tabId || page.targetId;
+function waitForXSettled(id, { timeoutMs = 30000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  let stable = 0;
+  let lastHref = '';
+  let errorPage = 0;
+  while (Date.now() < deadline) {
+    try {
+      const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn',
+        '() => ({ href: location.href, ready: document.readyState, host: location.hostname })'], { timeoutMs: 15000 }).result || {};
+      if (/^chrome-error:/.test(r.href || '') && r.ready === 'complete') {
+        if (++errorPage >= 3) throw new Error(`X page load failed in browser profile ${process.env.CLAWFEED_X_BROWSER_PROFILE || '(default)'}: chrome-error page (ERR_INVALID_RESPONSE; X is likely rejecting the logged-in session with HTTP 403)`);
+      } else errorPage = 0;
+      const okHost = /(^|\.)x\.com$/.test(r.host || '');
+      if (okHost && r.ready === 'complete' && r.href === lastHref) { if (++stable >= 2) return r; }
+      else stable = 0;
+      lastHref = r.href || '';
+    } catch (err) {
+      if (!isTransientBrowserError(err)) throw err;
+      stable = 0;
+    }
+    sleepSync(1000);
   }
-  const opened = runOpenClawBrowser(['open', 'https://x.com/home'], { timeoutMs: 30000 });
-  return opened.suggestedTargetId || opened.tabId || opened.targetId;
+  throw new Error(`X tab did not settle within ${timeoutMs}ms (last ${lastHref || 'unknown'})`);
+}
+
+function ensureOwnXTab() {
+  if (ownXTab) return ownXTab;
+  const opened = runOpenClawBrowser(['open', '--label', OWN_TAB_LABEL, 'https://x.com/home'], { timeoutMs: 30000 });
+  ownXTab = opened.suggestedTargetId || opened.tabId || opened.targetId || OWN_TAB_LABEL;
+  waitForXSettled(ownXTab);
+  return ownXTab;
 }
 
 function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, label = 'evaluate' } = {}) {
   const retries = Math.max(0, Number(process.env.CLAWFEED_X_BROWSER_RETRIES || 2));
   let lastErr = null;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
-    if (attempt > 0) restartBrowserSession();
+    if (attempt > 0) { closeOwnXTab(); sleepSync(2000 * attempt); }
     try {
-      focusXTab();
-      return runOpenClawBrowser(['evaluate', '--fn', fn], { timeoutMs, maxBuffer }).result;
+      const id = ensureOwnXTab();
+      waitForXSettled(id);
+      return runOpenClawBrowser(['evaluate', '--target-id', id, '--timeout-ms', String(timeoutMs), '--fn', fn], { timeoutMs, maxBuffer }).result;
     } catch (err) {
       lastErr = err;
       if (attempt >= retries || !isTransientBrowserError(err)) throw err;
-      console.error(`[clawfeed-x-pipeline] transient browser ${label} failure; retry ${attempt + 1}/${retries}: ${summarizeError(err)}`);
+      console.error(`[clawfeed-x-pipeline] transient browser ${label} failure; retry ${attempt + 1}/${retries} in a fresh own tab: ${summarizeError(err)}`);
     }
   }
   throw lastErr;
@@ -805,7 +815,7 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
   const sourceByHandle = loadSourceMap(db, user.id);
 
-  focusXTab();
+  ensureOwnXTab();
   const totalHours = Number(hours) || 30;
   const batchSizeHours = Math.max(0.1, Math.min(Number(batchHours) || 1, totalHours));
   const totalPageBudget = Number(pages) || 300;
@@ -930,7 +940,7 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
 }
 
 function fetchFollowingList({ pages }) {
-  focusXTab();
+  ensureOwnXTab();
   const pageBudget = Number(pages) || 120;
   const result = evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget }), {
     timeoutMs: Math.max(120000, pageBudget * 2500),
