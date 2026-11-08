@@ -172,11 +172,39 @@ function waitForXSettled(id, { timeoutMs = 30000 } = {}) {
   throw new Error(`X tab did not settle within ${timeoutMs}ms (last ${lastHref || 'unknown'})`);
 }
 
+// X account guard: the shared profile has more than one X account logged in.
+// Verify the active one before any fetch; never switch accounts.
+const X_EXPECTED_ACCOUNT = String(process.env.CLAWFEED_X_EXPECTED_ACCOUNT || 'bruceonbitcoin').replace(/^@/, '');
+let xAccountVerified = false;
+
+export function checkXAccountHref(href, expected = X_EXPECTED_ACCOUNT) {
+  const want = String(expected).replace(/^@/, '').toLowerCase();
+  const got = String(href || '').replace(/^https?:\/\/(www\.)?x\.com/i, '').replace(/^\//, '').split(/[/?#]/)[0];
+  if (!got) throw new Error(`X active account is unknown (no AppTabBar_Profile_Link), expected @${want}; not switching`);
+  if (got.toLowerCase() !== want) throw new Error(`X active account is @${got}, expected @${want}; not switching`);
+  return got;
+}
+
+function verifyXAccount(id) {
+  if (xAccountVerified) return;
+  let href = null;
+  for (let i = 0; i < 10 && !href; i += 1) {
+    const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn',
+      '() => { const a = document.querySelector(\'a[data-testid="AppTabBar_Profile_Link"]\'); return { href: a ? a.getAttribute("href") : null }; }'], { timeoutMs: 15000 }).result || {};
+    href = r.href || null;
+    if (!href) sleepSync(1000);
+  }
+  const handle = checkXAccountHref(href);
+  console.error(`[clawfeed-x-pipeline] X account guard ok: @${handle}`);
+  xAccountVerified = true;
+}
+
 function ensureOwnXTab() {
   if (ownXTab) return ownXTab;
   const opened = runOpenClawBrowser(['open', '--label', OWN_TAB_LABEL, 'https://x.com/home'], { timeoutMs: 30000 });
   ownXTab = opened.suggestedTargetId || opened.tabId || opened.targetId || OWN_TAB_LABEL;
   waitForXSettled(ownXTab);
+  verifyXAccount(ownXTab);
   return ownXTab;
 }
 
