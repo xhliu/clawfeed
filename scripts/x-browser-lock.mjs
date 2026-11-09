@@ -157,6 +157,7 @@ async function cli(argv) {
   });
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+// import.meta.main: an importer whose argv[1] happens to be this file (node -e ... <path>) must not run the CLI.
+if (import.meta.main ?? (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1])) {
   process.exitCode = await cli(process.argv.slice(2));
 }
