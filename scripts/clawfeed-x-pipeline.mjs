@@ -105,15 +105,37 @@ function loadSourceMap(db, userId) {
   return map;
 }
 
+// A local OpenClaw lock or busy gateway (another openclaw process holds state-lifecycle,
+// SQLite busy, gateway restarting) is transient and not an X problem: retry the same CLI
+// call after 10s, 30s, 60s. X-side errors never match and are thrown at once.
+const OPENCLAW_LOCAL_BUSY_RE = /owns state-lifecycle|another OpenClaw process|SQLite read-only worker|database is locked|SQLITE_BUSY|gateway (is )?(busy|unavailable|not reachable)/i;
+function cliRetryDelaysMs() {
+  const raw = process.env.CLAWFEED_X_CLI_RETRY_DELAYS;
+  const parts = (raw === undefined ? '10 30 60' : raw).trim().split(/[\s,]+/).filter(Boolean);
+  return parts.map(Number).filter((n) => Number.isFinite(n) && n >= 0).map((n) => n * 1000);
+}
+function isOpenClawLocalBusyError(err) {
+  return OPENCLAW_LOCAL_BUSY_RE.test([err?.message, err?.stderr, err?.stdout].filter(Boolean).map(String).join('\n'));
+}
+
 function runOpenClawBrowser(args, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024 } = {}) {
   const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
   const profileArgs = browserProfile ? ['--browser-profile', browserProfile] : [];
-  const stdout = execFileSync('openclaw', ['browser', ...profileArgs, '--json', '--timeout', String(timeoutMs), ...args], {
-    encoding: 'utf8',
-    maxBuffer,
-    timeout: timeoutMs + 10000,
-  });
-  return JSON.parse(stdout);
+  const delays = cliRetryDelaysMs();
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const stdout = execFileSync(process.env.CLAWFEED_OPENCLAW_BIN || 'openclaw', ['browser', ...profileArgs, '--json', '--timeout', String(timeoutMs), ...args], {
+        encoding: 'utf8',
+        maxBuffer,
+        timeout: timeoutMs + 10000,
+      });
+      return JSON.parse(stdout);
+    } catch (err) {
+      if (attempt >= delays.length || !isOpenClawLocalBusyError(err)) throw err;
+      console.error(`[clawfeed-x-pipeline] openclaw CLI busy/locked (attempt ${attempt + 1}); retrying in ${delays[attempt] / 1000}s: ${summarizeError(err).split('\n').slice(-2).join(' ')}`);
+      sleepSync(delays[attempt]);
+    }
+  }
 }
 
 function summarizeError(err) {
@@ -1416,6 +1438,10 @@ try {
       console.log('\nPOPULAR');
       printPopular(popular, false);
     }
+    if (!fetch.ok) {
+      console.error(`[clawfeed-x-pipeline] FETCH_FAILED: For you fetch failed; output ranks earlier samples only: ${fetch.error || 'unknown error'}`);
+      process.exitCode = 1;
+    }
   } else if (cmd === 'run-following-popular') {
     const runStartedAt = new Date().toISOString();
     const fetchHours = args.hours || 30;
@@ -1456,6 +1482,12 @@ try {
       }
       console.log('\nPOPULAR');
       printPopular(popular, false);
+    }
+    // Fail loud (2026-11-08): with no live fetch and no successful popular refresh the
+    // ranking is stale stored rows (or nothing) — exit non-zero so cron wrappers notify.
+    if (!fetch.ok && !(popularRefresh && popularRefresh.ok)) {
+      console.error(`[clawfeed-x-pipeline] FETCH_FAILED: live X fetch failed and no popular refresh succeeded${popularRefresh ? '' : ' (popular refresh not run)'}: ${fetch.error || 'unknown error'}`);
+      process.exitCode = 1;
     }
   } else {
     throw new Error(`Unknown command: ${cmd}`);
