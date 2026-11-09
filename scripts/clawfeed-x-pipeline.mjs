@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { acquireXBrowserLock } from './x-browser-lock.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -118,7 +119,17 @@ function isOpenClawLocalBusyError(err) {
   return OPENCLAW_LOCAL_BUSY_RE.test([err?.message, err?.stderr, err?.stdout].filter(Boolean).map(String).join('\n'));
 }
 
+// The X browser is shared by ClawFeed daily, OP_CAT, the follows ingest and the bookmark jobs: take the shared x-browser
+// mutex before the first browser call and hold it until this process exits (scripts/x-browser-lock.mjs).
+let xBrowserLocked = false;
+function ensureXBrowserLock() {
+  if (xBrowserLocked) return;
+  acquireXBrowserLock({ owner: `clawfeed-x-pipeline ${process.argv[2] || ''} pid ${process.pid}`.trim() });
+  xBrowserLocked = true;
+}
+
 function runOpenClawBrowser(args, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024 } = {}) {
+  ensureXBrowserLock();
   const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
   const profileArgs = browserProfile ? ['--browser-profile', browserProfile] : [];
   const delays = cliRetryDelaysMs();
