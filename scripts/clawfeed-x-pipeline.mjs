@@ -175,26 +175,43 @@ function closeOwnXTab() {
   if (!ownXTab) return;
   const id = ownXTab;
   ownXTab = null;
+  settledTabs.delete(id);
   try { runOpenClawBrowser(['close', id], { timeoutMs: 20000 }); } catch {}
 }
 process.on('exit', closeOwnXTab);
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { closeOwnXTab(); process.exit(130); });
 
-function waitForXSettled(id, { timeoutMs = 30000 } = {}) {
+// Each `openclaw browser evaluate` is a separate CLI process (10-15s under gateway load on 11/9), so the settle check
+// is poll-count based, not wall-clock only: a fresh tab needs two consecutive x.com/complete polls on the same URL, a tab
+// that already settled once needs one. The deadline (CLAWFEED_X_SETTLE_TIMEOUT_MS, default 120s) never cuts it below
+// MIN_SETTLE_POLLS polls. The error records the last readyState/visibility so a stuck page is diagnosable.
+const settledTabs = new Set();
+const MIN_SETTLE_POLLS = 4;
+function settleTimeoutMs() {
+  const v = Number(process.env.CLAWFEED_X_SETTLE_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : 120000;
+}
+function waitForXSettled(id, { timeoutMs = settleTimeoutMs() } = {}) {
   const deadline = Date.now() + timeoutMs;
+  const need = settledTabs.has(id) ? 1 : 2;
   let stable = 0;
+  let polls = 0;
   let lastHref = '';
+  let last = {};
   let errorPage = 0;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline || polls < MIN_SETTLE_POLLS) {
+    polls += 1;
     try {
       const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn',
-        '() => ({ href: location.href, ready: document.readyState, host: location.hostname })'], { timeoutMs: 15000 }).result || {};
+        '() => ({ href: location.href, ready: document.readyState, host: location.hostname, vis: document.visibilityState })'], { timeoutMs: 15000 }).result || {};
+      last = r;
       if (/^chrome-error:/.test(r.href || '') && r.ready === 'complete') {
         if (++errorPage >= 3) throw new Error(`X page load failed in browser profile ${process.env.CLAWFEED_X_BROWSER_PROFILE || '(default)'}: chrome-error page (ERR_INVALID_RESPONSE; X is likely rejecting the logged-in session with HTTP 403)`);
       } else errorPage = 0;
       const okHost = /(^|\.)x\.com$/.test(r.host || '');
-      if (okHost && r.ready === 'complete' && r.href === lastHref) { if (++stable >= 2) return r; }
-      else stable = 0;
+      if (okHost && r.ready === 'complete' && (stable === 0 || r.href === lastHref)) {
+        if (++stable >= need) { settledTabs.add(id); return r; }
+      } else stable = 0;
       lastHref = r.href || '';
     } catch (err) {
       if (!isTransientBrowserError(err)) throw err;
@@ -202,7 +219,7 @@ function waitForXSettled(id, { timeoutMs = 30000 } = {}) {
     }
     sleepSync(1000);
   }
-  throw new Error(`X tab did not settle within ${timeoutMs}ms (last ${lastHref || 'unknown'})`);
+  throw new Error(`X tab did not settle within ${timeoutMs}ms after ${polls} polls (last ${lastHref || 'unknown'} readyState=${last.ready || '?'} visibility=${last.vis || '?'})`);
 }
 
 // X account guard: the shared profile has more than one X account logged in.
