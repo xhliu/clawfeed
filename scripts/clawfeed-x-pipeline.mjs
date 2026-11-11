@@ -225,7 +225,7 @@ function waitForXSettled(id, { timeoutMs = settleTimeoutMs() } = {}) {
 // X account guard: the shared profile has more than one X account logged in.
 // Verify the active one before any fetch; never switch accounts.
 const X_EXPECTED_ACCOUNT = String(process.env.CLAWFEED_X_EXPECTED_ACCOUNT || 'bruceonbitcoin').replace(/^@/, '');
-let xAccountVerified = false;
+let xAccountVerifiedTab = null;
 
 export function checkXAccountHref(href, expected = X_EXPECTED_ACCOUNT) {
   const want = String(expected).replace(/^@/, '').toLowerCase();
@@ -236,7 +236,7 @@ export function checkXAccountHref(href, expected = X_EXPECTED_ACCOUNT) {
 }
 
 function verifyXAccount(id) {
-  if (xAccountVerified) return;
+  if (xAccountVerifiedTab === id) return;
   let href = null;
   for (let i = 0; i < 10 && !href; i += 1) {
     const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn',
@@ -246,7 +246,7 @@ function verifyXAccount(id) {
   }
   const handle = checkXAccountHref(href);
   console.error(`[clawfeed-x-pipeline] X account guard ok: @${handle}`);
-  xAccountVerified = true;
+  xAccountVerifiedTab = id;
 }
 
 function ensureOwnXTab() {
@@ -258,22 +258,59 @@ function ensureOwnXTab() {
   return ownXTab;
 }
 
+// Our own tab can vanish under us (11/10 16:13: every call then failed "tab not found: browser tab clawfeed-x-<pid>",
+// with no close from this process). Recovery stays under the SAME x-browser lock (never released): open a fresh own
+// tab, re-run the account guard on it, wait for it to settle and retry the failed step. At most
+// CLAWFEED_X_TAB_REOPENS (default 2) reopens per run; then the error propagates and the run ends FETCH_FAILED.
+const TAB_GONE_RE = /tab not found|no tab (found|with)|target (closed|not found|detached)|No target with given id|Target\.detachedFromTarget|detached from target/i;
+function isOwnTabGoneError(err) { return TAB_GONE_RE.test(summarizeError(err)); }
+let tabReopens = 0;
+function maxTabReopens() {
+  const v = Number(process.env.CLAWFEED_X_TAB_REOPENS);
+  return Number.isFinite(v) && v >= 0 ? v : 2;
+}
+function forgetVanishedOwnTab(err, label) {
+  const gone = ownXTab;
+  ownXTab = null; // gone already: do not send a close for it
+  if (gone) settledTabs.delete(gone);
+  xAccountVerifiedTab = null;
+  tabReopens += 1;
+  console.error(`[clawfeed-x-pipeline] own X tab ${gone || OWN_TAB_LABEL} vanished during ${label}; reopen ${tabReopens}/${maxTabReopens()} under the held x-browser lock (fresh tab, account guard, settle, retry): ${summarizeError(err).split('\n').slice(-2).join(' ')}`);
+}
+
+function prepareOwnXTab(label = 'tab prepare') {
+  for (;;) {
+    try { return ensureOwnXTab(); } catch (err) {
+      if (!isOwnTabGoneError(err) || tabReopens >= maxTabReopens()) throw err;
+      forgetVanishedOwnTab(err, label);
+    }
+  }
+}
+
 function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, label = 'evaluate' } = {}) {
   const retries = Math.max(0, Number(process.env.CLAWFEED_X_BROWSER_RETRIES || 2));
-  let lastErr = null;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    if (attempt > 0) { closeOwnXTab(); sleepSync(2000 * attempt); }
+  let attempt = 0;
+  for (;;) {
     try {
       const id = ensureOwnXTab();
       waitForXSettled(id);
       return runOpenClawBrowser(['evaluate', '--target-id', id, '--timeout-ms', String(timeoutMs), '--fn', fn], { timeoutMs, maxBuffer }).result;
     } catch (err) {
-      lastErr = err;
+      if (isOwnTabGoneError(err)) {
+        if (tabReopens >= maxTabReopens()) {
+          console.error(`[clawfeed-x-pipeline] own X tab vanished again during ${label}; reopen limit ${maxTabReopens()} reached, giving up`);
+          throw err;
+        }
+        forgetVanishedOwnTab(err, label);
+        continue;
+      }
       if (attempt >= retries || !isTransientBrowserError(err)) throw err;
-      console.error(`[clawfeed-x-pipeline] transient browser ${label} failure; retry ${attempt + 1}/${retries} in a fresh own tab: ${summarizeError(err)}`);
+      attempt += 1;
+      console.error(`[clawfeed-x-pipeline] transient browser ${label} failure; retry ${attempt}/${retries} in a fresh own tab: ${summarizeError(err)}`);
+      closeOwnXTab();
+      sleepSync(2000 * attempt);
     }
   }
-  throw lastErr;
 }
 
 function makeFetchFn(pages) {
@@ -893,7 +930,7 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
   const sourceByHandle = loadSourceMap(db, user.id);
 
-  ensureOwnXTab();
+  prepareOwnXTab();
   const totalHours = Number(hours) || 30;
   const batchSizeHours = Math.max(0.1, Math.min(Number(batchHours) || 1, totalHours));
   const totalPageBudget = Number(pages) || 300;
@@ -1018,7 +1055,7 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
 }
 
 function fetchFollowingList({ pages }) {
-  ensureOwnXTab();
+  prepareOwnXTab();
   const pageBudget = Number(pages) || 120;
   const result = evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget }), {
     timeoutMs: Math.max(120000, pageBudget * 2500),
