@@ -251,8 +251,10 @@ function verifyXAccount(id) {
 
 function ensureOwnXTab() {
   if (ownXTab) return ownXTab;
-  const opened = runOpenClawBrowser(['open', '--label', OWN_TAB_LABEL, 'https://x.com/home'], { timeoutMs: 30000 });
-  ownXTab = opened.suggestedTargetId || opened.tabId || opened.targetId || OWN_TAB_LABEL;
+  // A reopen gets its own label so it can never resolve to the vanished tab if the gateway only lost the label.
+  const label = tabReopens > 0 ? `${OWN_TAB_LABEL}-r${tabReopens}` : OWN_TAB_LABEL;
+  const opened = runOpenClawBrowser(['open', '--label', label, 'https://x.com/home'], { timeoutMs: 30000 });
+  ownXTab = opened.suggestedTargetId || opened.tabId || opened.targetId || label;
   waitForXSettled(ownXTab);
   verifyXAccount(ownXTab);
   return ownXTab;
