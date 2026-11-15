@@ -1043,6 +1043,8 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
   return {
     ok: true,
     query: query || 'filter:follows',
+    verifiedAccount: X_EXPECTED_ACCOUNT,
+    accountVerification: 'DOM profile link checked before every browser evaluation',
     lookbackHours: totalHours,
     sliceMinutes: sliceMinutes || 10,
     minSliceMinutes: minSliceMinutes || 1,
@@ -1525,6 +1527,7 @@ try {
     try {
       fetch = fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: fetchHours, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
     } catch (err) {
+      if (/X active account is/.test(summarizeError(err))) throw err; // account mismatch is terminal, never a refresh/fallback opportunity
       fetch = failedFetchResult(err, { query: args.query || 'filter:follows', lookbackHours: Number(fetchHours) || 30 });
       console.error(`[clawfeed-x-pipeline] short catch-up failed; continuing only if live popular refresh succeeds: ${fetch.error}`);
     }
