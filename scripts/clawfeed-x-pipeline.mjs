@@ -176,7 +176,10 @@ function closeOwnXTab() {
   const id = ownXTab;
   ownXTab = null;
   settledTabs.delete(id);
-  try { runOpenClawBrowser(['close', id], { timeoutMs: 20000 }); } catch {}
+  try {
+    const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn', '() => ({host: location.hostname})'], {timeoutMs:15000}).result;
+    if (/(^|\.)x\.com$/.test(r?.host || '')) runOpenClawBrowser(['close', id], { timeoutMs: 20000 });
+  } catch {}
 }
 process.on('exit', closeOwnXTab);
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { closeOwnXTab(); process.exit(130); });
@@ -209,6 +212,7 @@ function waitForXSettled(id, { timeoutMs = settleTimeoutMs() } = {}) {
         if (++errorPage >= 3) throw new Error(`X page load failed in browser profile ${process.env.CLAWFEED_X_BROWSER_PROFILE || '(default)'}: chrome-error page (ERR_INVALID_RESPONSE; X is likely rejecting the logged-in session with HTTP 403)`);
       } else errorPage = 0;
       const okHost = /(^|\.)x\.com$/.test(r.host || '');
+      if (!okHost && /^https?:/.test(r.href || '')) throw new Error(`X_TAB_OWNERSHIP_LOST: ${id} navigated outside X (${r.host}); abandon without close`);
       if (okHost && r.ready === 'complete' && (stable === 0 || r.href === lastHref)) {
         if (++stable >= need) { settledTabs.add(id); return r; }
       } else stable = 0;
@@ -254,7 +258,8 @@ function ensureOwnXTab() {
   // A reopen gets its own label so it can never resolve to the vanished tab if the gateway only lost the label.
   const label = tabReopens > 0 ? `${OWN_TAB_LABEL}-r${tabReopens}` : OWN_TAB_LABEL;
   const opened = runOpenClawBrowser(['open', '--label', label, 'https://x.com/home'], { timeoutMs: 30000 });
-  ownXTab = opened.suggestedTargetId || opened.tabId || opened.targetId || label;
+  ownXTab = opened.targetId || opened.tabId || opened.suggestedTargetId || label;
+  console.error(`[clawfeed-x-pipeline] opened own X tab label=${label} target=${ownXTab}`);
   waitForXSettled(ownXTab);
   verifyXAccount(ownXTab);
   return ownXTab;
@@ -265,7 +270,7 @@ function ensureOwnXTab() {
 // tab, re-run the account guard on it, wait for it to settle and retry the failed step. At most
 // CLAWFEED_X_TAB_REOPENS (default 2) reopens per run; then the error propagates and the run ends FETCH_FAILED.
 const TAB_GONE_RE = /tab not found|no tab (found|with)|target (closed|not found|detached)|No target with given id|Target\.detachedFromTarget|detached from target/i;
-function isOwnTabGoneError(err) { return TAB_GONE_RE.test(summarizeError(err)); }
+function isOwnTabGoneError(err) { return /X_TAB_OWNERSHIP_LOST/.test(summarizeError(err)) || TAB_GONE_RE.test(summarizeError(err)); }
 let tabReopens = 0;
 function maxTabReopens() {
   const v = Number(process.env.CLAWFEED_X_TAB_REOPENS);
@@ -283,7 +288,8 @@ function forgetVanishedOwnTab(err, label) {
 function prepareOwnXTab(label = 'tab prepare') {
   for (;;) {
     try { return ensureOwnXTab(); } catch (err) {
-      if (!isOwnTabGoneError(err) || tabReopens >= maxTabReopens()) throw err;
+      if (!isOwnTabGoneError(err)) throw err;
+      if (tabReopens >= maxTabReopens()) { forgetVanishedOwnTab(err, label); throw err; }
       forgetVanishedOwnTab(err, label);
     }
   }
@@ -300,6 +306,7 @@ function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, lab
     } catch (err) {
       if (isOwnTabGoneError(err)) {
         if (tabReopens >= maxTabReopens()) {
+          forgetVanishedOwnTab(err, label);
           console.error(`[clawfeed-x-pipeline] own X tab vanished again during ${label}; reopen limit ${maxTabReopens()} reached, giving up`);
           throw err;
         }
@@ -309,7 +316,8 @@ function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, lab
       if (attempt >= retries || !isTransientBrowserError(err)) throw err;
       attempt += 1;
       console.error(`[clawfeed-x-pipeline] transient browser ${label} failure; retry ${attempt}/${retries} in a fresh own tab: ${summarizeError(err)}`);
-      closeOwnXTab();
+      // Navigation races can mean another user has adopted the tab. Never close it on a transient failure.
+      forgetVanishedOwnTab(err, label);
       sleepSync(2000 * attempt);
     }
   }
@@ -321,7 +329,7 @@ function makeFetchFn(pages) {
     const BEARER_FALLBACK = ${JSON.stringify(X_BEARER_FALLBACK)};
     const HOME_QUERY_ID_FALLBACK = ${JSON.stringify(HOME_QUERY_ID_FALLBACK)};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    if (!location.hostname.endsWith('x.com')) location.href = 'https://x.com/home';
+    if (!/(^|\\.)x\\.com$/.test(location.hostname)) throw new Error('X_TAB_OWNERSHIP_LOST: evaluate outside X');
     await sleep(800);
 
     async function getClientConfig() {
@@ -502,7 +510,7 @@ function makeFetchFollowingSearchFn({ pages, query, hours, sliceMinutes, minSlic
     const BEARER_FALLBACK = ${JSON.stringify(X_BEARER_FALLBACK)};
     const SEARCH_QUERY_ID_FALLBACK = ${JSON.stringify(SEARCH_QUERY_ID_FALLBACK)};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    if (!location.hostname.endsWith('x.com')) location.href = 'https://x.com/home';
+    if (!/(^|\\.)x\\.com$/.test(location.hostname)) throw new Error('X_TAB_OWNERSHIP_LOST: evaluate outside X');
     await sleep(800);
 
     async function getClientConfig() {
@@ -698,7 +706,7 @@ function makeFetchFollowingListFn({ pages }) {
     const BEARER_FALLBACK = ${JSON.stringify(X_BEARER_FALLBACK)};
     const FOLLOWING_QUERY_ID_FALLBACK = ${JSON.stringify(FOLLOWING_QUERY_ID_FALLBACK)};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-    if (!location.hostname.endsWith('x.com')) location.href = 'https://x.com/home';
+    if (!/(^|\\.)x\\.com$/.test(location.hostname)) throw new Error('X_TAB_OWNERSHIP_LOST: evaluate outside X');
     await sleep(800);
 
     async function getClientConfig() {
