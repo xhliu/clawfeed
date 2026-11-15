@@ -240,7 +240,7 @@ export function checkXAccountHref(href, expected = X_EXPECTED_ACCOUNT) {
 }
 
 function verifyXAccount(id) {
-  if (xAccountVerifiedTab === id) return;
+  // Recheck each evaluation: shared account can change without changing the tab ID.
   let href = null;
   for (let i = 0; i < 10 && !href; i += 1) {
     const r = runOpenClawBrowser(['evaluate', '--target-id', id, '--fn',
@@ -254,7 +254,7 @@ function verifyXAccount(id) {
 }
 
 function ensureOwnXTab() {
-  if (ownXTab) return ownXTab;
+  if (ownXTab) { verifyXAccount(ownXTab); return ownXTab; }
   // A reopen gets its own label so it can never resolve to the vanished tab if the gateway only lost the label.
   const label = tabReopens > 0 ? `${OWN_TAB_LABEL}-r${tabReopens}` : OWN_TAB_LABEL;
   const opened = runOpenClawBrowser(['open', '--label', label, 'https://x.com/home'], { timeoutMs: 30000 });
