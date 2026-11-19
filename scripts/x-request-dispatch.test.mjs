@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {dispatchChargedBatch,dispatchChargedRequest} from './x-request-dispatch.mjs';
+let charged=0,sent=0;
+let result=await dispatchChargedBatch({requests:[1,2,3],reserve(){if(charged===2)throw Error('budget');charged++;},dispatch(){sent++;return sent;}});
+assert.equal(sent,2);assert.equal(charged,2);assert.equal(result.complete,false);assert.deepEqual(result.results,[1,2]);
+charged=0;sent=0;
+await assert.rejects(dispatchChargedRequest({request:1,retries:2,retryable:()=>true,reserve(){if(charged===1)throw Error('expired');charged++;},dispatch(){sent++;throw Error('retryable');}}),/expired/);
+assert.equal(sent,1);assert.equal(charged,1);
+charged=0;sent=0;
+await dispatchChargedRequest({request:1,retries:1,retryable:()=>true,reserve(){charged++;},dispatch(){if(++sent===1)throw Error('transient');return true;}});
+assert.equal(charged,2);assert.equal(sent,2);
+console.log('per-attempt reservation, denied retry and partial batch tests passed');
