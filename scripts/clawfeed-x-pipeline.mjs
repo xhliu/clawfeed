@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { meteredEvaluate } from './x-browser-metered-evaluate.mjs';
+import { reserveLoad, grantRefusal } from '/Users/aibot/.openclaw/workspace/.clawdbot/lib/x-shared-load-budget.mjs';
 import { acquireXBrowserLock } from './x-browser-lock.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -128,6 +130,14 @@ function ensureXBrowserLock() {
   xBrowserLocked = true;
 }
 
+function chargeTransportRequest(url) {
+  const holdFile=process.env.CLAWFEED_X_HOLD_FILE,ledger=process.env.CLAWFEED_X_LOAD_LEDGER,holder=process.env.CLAWFEED_X_HOLDER;
+  if(!holdFile||!ledger||!holder)throw Error('Missing metered X transport grant configuration');
+  const hold=JSON.parse(readFileSync(holdFile,'utf8'));
+  if(hold.transport_requests_allowed!==true)throw Error('Grant does not allow transport requests');
+  reserveLoad({holdFile,ledger,holder,url,account:'@bruceonbitcoin'});
+}
+
 function runOpenClawBrowser(args, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024 } = {}) {
   ensureXBrowserLock();
   const browserProfile = (process.env.CLAWFEED_X_BROWSER_PROFILE || '').trim();
@@ -135,6 +145,7 @@ function runOpenClawBrowser(args, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 
   const delays = cliRetryDelaysMs();
   for (let attempt = 0; ; attempt += 1) {
     try {
+      if(['open','navigate'].includes(args[0]))chargeTransportRequest(args[1]);
       const stdout = execFileSync(process.env.CLAWFEED_OPENCLAW_BIN || 'openclaw', ['browser', ...profileArgs, '--json', '--timeout', String(timeoutMs), ...args], {
         encoding: 'utf8',
         maxBuffer,
@@ -295,14 +306,19 @@ function prepareOwnXTab(label = 'tab prepare') {
   }
 }
 
-function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, label = 'evaluate' } = {}) {
+async function evaluateOnX(fn, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 1024, label = 'evaluate' } = {}) {
   const retries = Math.max(0, Number(process.env.CLAWFEED_X_BROWSER_RETRIES || 2));
   let attempt = 0;
   for (;;) {
     try {
       const id = ensureOwnXTab();
       waitForXSettled(id);
-      return runOpenClawBrowser(['evaluate', '--target-id', id, '--timeout-ms', String(timeoutMs), '--fn', fn], { timeoutMs, maxBuffer }).result;
+      return await meteredEvaluate({fn,timeoutMs,
+        evaluate: async code => runOpenClawBrowser(['evaluate','--target-id',id,'--timeout-ms',String(timeoutMs),'--fn',code],{timeoutMs,maxBuffer}).result,
+        guard: async () => { waitForXSettled(id); verifyXAccount(id); },
+        reserve: async request => {
+          chargeTransportRequest(request.url);
+        },sleep:async ms=>sleepSync(ms)});
     } catch (err) {
       if (isOwnTabGoneError(err)) {
         if (tabReopens >= maxTabReopens()) {
@@ -873,17 +889,17 @@ function normalizeIsoDate(createdAt) {
   return d.toISOString();
 }
 
-function fetchTweets({ dbPath, userSlug, pages }) {
+async function fetchTweets({ dbPath, userSlug, pages }) {
   const db = getDb(dbPath);
   const user = getUser(db, userSlug);
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
   const sourceByHandle = loadSourceMap(db, user.id);
 
-  const result = evaluateOnX(makeFetchFn(pages), {
+  const result = await evaluateOnX(makeFetchFn(pages), {
     timeoutMs: Math.max(120000, (pages || 6) * 25000),
     label: 'home fetch',
   });
-  if (!result?.ok) throw new Error(`X fetch failed: ${JSON.stringify(result || {})}`);
+  if (!result?.ok && !result?.budgetDenied) throw new Error(`X fetch failed: ${JSON.stringify(result || {})}`);
 
   const stmt = db.prepare(`
     INSERT INTO raw_items (
@@ -925,7 +941,10 @@ function fetchTweets({ dbPath, userSlug, pages }) {
   });
   tx(result.tweets || []);
   return {
-    ok: true,
+    ok: result.ok === true,
+    complete: !result.budgetDenied,
+    budgetDenied: Boolean(result.budgetDenied),
+    error: result.error || null,
     fetched: result.tweets?.length || 0,
     storedChanges: insertedOrUpdated,
     matchedSources,
@@ -934,7 +953,7 @@ function fetchTweets({ dbPath, userSlug, pages }) {
   };
 }
 
-function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinutes, minSliceMinutes, pagesPerSlice, batchHours }) {
+async function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinutes, minSliceMinutes, pagesPerSlice, batchHours }) {
   const db = getDb(dbPath);
   const user = getUser(db, userSlug);
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
@@ -956,7 +975,7 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
     const currentHours = Math.min(batchSizeHours, (endMs - cutoffMs) / (60 * 60 * 1000));
     const windowsInBatch = Math.ceil((currentHours * 60) / (Number(sliceMinutes) || 10));
     const batchPages = Math.min(pageBudget, Math.max(1, windowsInBatch * (Number(pagesPerSlice) || 2)));
-    const result = evaluateOnX(makeFetchFollowingSearchFn({
+    const result = await evaluateOnX(makeFetchFollowingSearchFn({
       pages: batchPages,
       hours: currentHours,
       query,
@@ -1066,25 +1085,33 @@ function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sliceMinu
   };
 }
 
-function fetchFollowingList({ pages }) {
+async function fetchFollowingList({ pages }) {
   prepareOwnXTab();
   const pageBudget = Number(pages) || 120;
-  const result = evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget }), {
+  const result = await evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget }), {
     timeoutMs: Math.max(120000, pageBudget * 2500),
     maxBuffer: 128 * 1024 * 1024,
     label: 'current following sync',
   });
+  if (result?.budgetDenied) return result;
   if (!result?.ok) throw new Error(`X following list fetch failed: ${JSON.stringify(result || {})}`);
   if (!result.complete) throw new Error(`X following list fetch did not complete within ${pageBudget} pages`);
   return result;
 }
 
-function syncFollowingSources({ dbPath, userSlug, pages }) {
+async function syncFollowingSources({ dbPath, userSlug, pages }) {
   const db = getDb(dbPath);
   const user = getUser(db, userSlug);
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
 
-  const result = fetchFollowingList({ pages });
+  const result = await fetchFollowingList({ pages });
+  if (result.budgetDenied || result.complete !== true) {
+    // Retain admitted evidence without mutating authoritative subscriptions or deleting absent accounts.
+    const artifact = `${dbPath || DEFAULT_DB}.following-partial.json`;
+    writeFileSync(artifact+'.tmp',JSON.stringify({...result,complete:false,observedAt:new Date().toISOString()},null,2)+'\n',{mode:0o600});
+    renameSync(artifact+'.tmp',artifact);
+    return {ok:false,complete:false,budgetDenied:Boolean(result.budgetDenied),fetched:result.following?.length||0,artifact,error:result.error||'Incomplete following coverage; subscriptions unchanged'};
+  }
   const latestByHandle = new Map();
   for (const account of result.following || []) {
     const handle = normalizeHandle(account.handle || account.screenName);
@@ -1404,7 +1431,7 @@ function insertDigest({ dbPath, userSlug, file }) {
   return { ok: true, id: Number(info.lastInsertRowid), userSlug: user.slug, chars: content.trim().length };
 }
 
-function popularRefreshFetch({ common, args, fetchHours, candidateHours }) {
+async function popularRefreshFetch({ common, args, fetchHours, candidateHours }) {
   const baseQuery = String(args.query || 'filter:follows').trim();
   if (args.popularRefresh === false || baseQuery !== 'filter:follows') return null;
   const lookbackHours = Number(candidateHours) || Number(fetchHours) || 30;
@@ -1417,7 +1444,7 @@ function popularRefreshFetch({ common, args, fetchHours, candidateHours }) {
     ? Math.floor(args.popularRefreshPages)
     : Math.max(60, Math.ceil(lookbackHours) * 2);
 
-  return fetchFollowingSearch({
+  return await fetchFollowingSearch({
     ...common,
     pages,
     hours: lookbackHours,
@@ -1453,13 +1480,13 @@ const common = { dbPath: args.db || process.env.CLAWFEED_DB || DEFAULT_DB, userS
 
 try {
   if (cmd === 'fetch') {
-    const out = fetchTweets({ ...common, pages: args.pages || 6 });
+    const out = await fetchTweets({ ...common, pages: args.pages || 6 });
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'fetch-following') {
-    const out = fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: args.hours || 30, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
+    const out = await fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: args.hours || 30, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'sync-following') {
-    const out = syncFollowingSources({ ...common, pages: args.syncFollowingPages || args.pages || 120 });
+    const out = await syncFollowingSources({ ...common, pages: args.syncFollowingPages || args.pages || 120 });
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'candidates') {
     printCandidates(candidateRows({ ...common, limit: args.limit || 40, hours: args.candidateHours || args.hours || 30 }), args.json);
@@ -1468,7 +1495,7 @@ try {
   } else if (cmd === 'insert') {
     console.log(JSON.stringify(insertDigest({ ...common, file: args.file }), null, 2));
   } else if (cmd === 'run') {
-    const fetch = fetchTweets({ ...common, pages: args.pages || 6 });
+    const fetch = await fetchTweets({ ...common, pages: args.pages || 6 });
     const candidates = candidateRows({ ...common, limit: args.limit || 40, hours: args.candidateHours || args.hours || 30 });
     if (args.json) console.log(JSON.stringify({ fetch, candidates }, null, 2));
     else {
@@ -1478,7 +1505,7 @@ try {
       printCandidates(candidates, false);
     }
   } else if (cmd === 'run-following') {
-    const fetch = fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: args.hours || 30, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
+    const fetch = await fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: args.hours || 30, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
     const candidates = candidateRows({ ...common, limit: args.limit || 80, hours: args.candidateHours || args.hours || 30 });
     if (args.json) console.log(JSON.stringify({ fetch, candidates }, null, 2));
     else {
@@ -1495,7 +1522,7 @@ try {
     const sampledHours = args.sampledHours || 24;
     let fetch;
     try {
-      fetch = fetchTweets({ ...common, pages: args.pages || 20 });
+      fetch = await fetchTweets({ ...common, pages: args.pages || 20 });
     } catch (err) {
       fetch = failedFetchResult(err, { query: 'HomeTimeline', lookbackHours: Number(sampledHours) || 24 });
       console.error(`[clawfeed-x-pipeline] For you fetch failed; ranking earlier samples only: ${fetch.error}`);
@@ -1525,7 +1552,7 @@ try {
     const candidateHours = args.candidateHours || args.hours || 30;
     let fetch;
     try {
-      fetch = fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: fetchHours, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
+      fetch = await fetchFollowingSearch({ ...common, pages: args.pages || 300, hours: fetchHours, query: args.query || 'filter:follows', sliceMinutes: args.sliceMinutes || 10, minSliceMinutes: args.minSliceMinutes || 1, pagesPerSlice: args.pagesPerSlice || 2, batchHours: args.batchHours || 1 });
     } catch (err) {
       if (/X active account is/.test(summarizeError(err))) throw err; // account mismatch is terminal, never a refresh/fallback opportunity
       fetch = failedFetchResult(err, { query: args.query || 'filter:follows', lookbackHours: Number(fetchHours) || 30 });
@@ -1533,7 +1560,7 @@ try {
     }
     let popularRefresh = null;
     try {
-      popularRefresh = popularRefreshFetch({ common, args, fetchHours, candidateHours });
+      popularRefresh = await popularRefreshFetch({ common, args, fetchHours, candidateHours });
     } catch (err) {
       popularRefresh = failedFetchResult(err, { query: `${args.query || 'filter:follows'} min_faves`, lookbackHours: Number(candidateHours) || 30 });
       console.error(`[clawfeed-x-pipeline] popular refresh failed; falling back to stored all-following rows: ${popularRefresh.error}`);
