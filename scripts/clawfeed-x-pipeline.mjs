@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -899,7 +899,7 @@ async function fetchTweets({ dbPath, userSlug, pages }) {
     timeoutMs: Math.max(120000, (pages || 6) * 25000),
     label: 'home fetch',
   });
-  if (!result?.ok) throw new Error(`X fetch failed: ${JSON.stringify(result || {})}`);
+  if (!result?.ok && !result?.budgetDenied) throw new Error(`X fetch failed: ${JSON.stringify(result || {})}`);
 
   const stmt = db.prepare(`
     INSERT INTO raw_items (
@@ -941,7 +941,10 @@ async function fetchTweets({ dbPath, userSlug, pages }) {
   });
   tx(result.tweets || []);
   return {
-    ok: true,
+    ok: result.ok === true,
+    complete: !result.budgetDenied,
+    budgetDenied: Boolean(result.budgetDenied),
+    error: result.error || null,
     fetched: result.tweets?.length || 0,
     storedChanges: insertedOrUpdated,
     matchedSources,
@@ -1090,6 +1093,7 @@ async function fetchFollowingList({ pages }) {
     maxBuffer: 128 * 1024 * 1024,
     label: 'current following sync',
   });
+  if (result?.budgetDenied) return result;
   if (!result?.ok) throw new Error(`X following list fetch failed: ${JSON.stringify(result || {})}`);
   if (!result.complete) throw new Error(`X following list fetch did not complete within ${pageBudget} pages`);
   return result;
@@ -1101,6 +1105,13 @@ async function syncFollowingSources({ dbPath, userSlug, pages }) {
   if (!user) throw new Error(`No ClawFeed user found for slug ${userSlug}`);
 
   const result = await fetchFollowingList({ pages });
+  if (result.budgetDenied || result.complete !== true) {
+    // Retain admitted evidence without mutating authoritative subscriptions or deleting absent accounts.
+    const artifact = `${dbPath || DEFAULT_DB}.following-partial.json`;
+    writeFileSync(artifact+'.tmp',JSON.stringify({...result,complete:false,observedAt:new Date().toISOString()},null,2)+'\n',{mode:0o600});
+    renameSync(artifact+'.tmp',artifact);
+    return {ok:false,complete:false,budgetDenied:Boolean(result.budgetDenied),fetched:result.following?.length||0,artifact,error:result.error||'Incomplete following coverage; subscriptions unchanged'};
+  }
   const latestByHandle = new Map();
   for (const account of result.following || []) {
     const handle = normalizeHandle(account.handle || account.screenName);
