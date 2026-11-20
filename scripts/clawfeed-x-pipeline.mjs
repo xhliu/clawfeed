@@ -984,7 +984,7 @@ async function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sli
       pagesPerSlice,
       untilMs: endMs,
     }), {
-      timeoutMs: Math.max(90000, batchPages * 4000),
+      timeoutMs: Math.max(120000, batchPages * 30000),
       maxBuffer: 128 * 1024 * 1024,
       label: `following search batch ${batches.length + 1}`,
     });
