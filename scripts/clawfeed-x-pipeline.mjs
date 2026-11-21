@@ -716,9 +716,11 @@ function makeFetchFollowingSearchFn({ pages, query, hours, sliceMinutes, minSlic
   }`;
 }
 
-function makeFetchFollowingListFn({ pages }) {
+function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
   return `async () => {
     const maxPages = ${Number(pages) || 120};
+    const resumeCursor = ${JSON.stringify(startCursor || null)};
+    const seedRows = ${JSON.stringify(seedFollowing || [])};
     const BEARER_FALLBACK = ${JSON.stringify(X_BEARER_FALLBACK)};
     const FOLLOWING_QUERY_ID_FALLBACK = ${JSON.stringify(FOLLOWING_QUERY_ID_FALLBACK)};
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -808,8 +810,19 @@ function makeFetchFollowingListFn({ pages }) {
     };
     const users = new Map();
     const pageSummaries = [];
-    let cursor = null;
+    let cursor = resumeCursor;
     let complete = false;
+    // Resume: pre-populate accumulated handles so a resumed pass carries forward prior pages.
+    for (const row of seedRows) {
+      const handle = '@' + String((row.handle || row.screenName || '')).replace(/^@/, '');
+      if (handle === '@') continue;
+      users.set(handle.toLowerCase(), {
+        handle,
+        screenName: String(row.screenName || row.handle || '').replace(/^@/, ''),
+        name: row.name || row.screenName || '',
+        restId: row.restId || null
+      });
+    }
 
     function addUser(result) {
       if (!result || typeof result !== 'object') return;
@@ -1085,10 +1098,23 @@ async function fetchFollowingSearch({ dbPath, userSlug, pages, hours, query, sli
   };
 }
 
-async function fetchFollowingList({ pages }) {
+async function fetchFollowingList({ pages, resumeArtifact }) {
   prepareOwnXTab();
   const pageBudget = Number(pages) || 120;
-  const result = await evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget }), {
+  // Resume a prior partial pass instead of restarting at cursor=null: carry its
+  // accumulated handles and last page cursor forward so the ~62 pages complete
+  // over multiple hourly passes within the shared budget.
+  let startCursor = null;
+  let seedFollowing = [];
+  if (!resumeArtifact) resumeArtifact = (process.env.CLAWFEED_FOLLOWING_RESUME_JSON || `${DEFAULT_DB}.following-partial.json`);
+  try {
+    const prior = JSON.parse(readFileSync(resumeArtifact, 'utf8'));
+    if (Array.isArray(prior.following) && prior.following.length) seedFollowing = prior.following;
+    const pagesArr = Array.isArray(prior.pages) ? prior.pages : [];
+    const last = pagesArr[pagesArr.length - 1];
+    if (last && last.cursor) startCursor = last.cursor;
+  } catch { /* no prior partial to resume */ }
+  const result = await evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget, startCursor, seedFollowing }), {
     timeoutMs: Math.max(120000, pageBudget * 2500),
     maxBuffer: 128 * 1024 * 1024,
     label: 'current following sync',
