@@ -130,6 +130,17 @@ function ensureXBrowserLock() {
   xBrowserLocked = true;
 }
 
+// The URL an `openclaw browser open|navigate ...` call loads. Flags come first (`open --label NAME URL`), so args[1] was
+// "--label" and the ledger charged a flag instead of the page (2026-11-24: 14 "--label" rows).
+export function browserCommandUrl(args) {
+  for (let i = 1; i < args.length; i += 1) {
+    const a = String(args[i]);
+    if (a.startsWith('--')) { if (!a.includes('=')) i += 1; continue; }
+    return a;
+  }
+  throw Error(`browser ${args[0]} without a URL`);
+}
+
 function chargeTransportRequest(url) {
   const holdFile=process.env.CLAWFEED_X_HOLD_FILE,ledger=process.env.CLAWFEED_X_LOAD_LEDGER,holder=process.env.CLAWFEED_X_HOLDER;
   if(!holdFile||!ledger||!holder)throw Error('Missing metered X transport grant configuration');
@@ -145,7 +156,7 @@ function runOpenClawBrowser(args, { timeoutMs = 120000, maxBuffer = 64 * 1024 * 
   const delays = cliRetryDelaysMs();
   for (let attempt = 0; ; attempt += 1) {
     try {
-      if(['open','navigate'].includes(args[0]))chargeTransportRequest(args[1]);
+      if(['open','navigate'].includes(args[0]))chargeTransportRequest(browserCommandUrl(args));
       const stdout = execFileSync(process.env.CLAWFEED_OPENCLAW_BIN || 'openclaw', ['browser', ...profileArgs, '--json', '--timeout', String(timeoutMs), ...args], {
         encoding: 'utf8',
         maxBuffer,
