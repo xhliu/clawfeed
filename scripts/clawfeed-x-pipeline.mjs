@@ -41,6 +41,7 @@ function parseArgs(argv) {
     else if (a === '--popular-refresh-pages') args.popularRefreshPages = Number(argv[++i]);
     else if (a === '--exclude-active-source') args.excludeActiveSource = true;
     else if (a === '--sync-following-pages') args.syncFollowingPages = Number(argv[++i]);
+    else if (a === '--artifact') args.artifact = argv[++i];
     else if (a === '--file') args.file = argv[++i];
     else if (a === '--json') args.json = true;
     else if (a === '--help' || a === '-h') args.help = true;
@@ -50,7 +51,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  console.log(`Usage: scripts/clawfeed-x-pipeline.mjs <fetch|fetch-following|sync-following|candidates|popular|insert|run|run-following|run-following-popular|run-home-popular> [options]\n\nCommands:\n  fetch            Fetch X Home timeline via the logged-in OpenClaw browser session and store raw_items\n  fetch-following  Fetch latest tweets from all followed accounts via X search filter:follows\n  sync-following   Best-effort sync of ClawFeed twitter_feed sources to the logged-in X account's current Following list\n  candidates       Print recent high-signal raw_items for a digest\n  insert           Insert a digest from stdin or --file into ClawFeed\n  run              Fetch Home timeline + print candidates (cron/agent composes the digest)\n  run-following    Fetch all-following timeline + print candidates\n  run-following-popular  Fetch live all-following tweets, then rank only rows refreshed by this run\n  run-home-popular  Fetch a For you (Home) sample, then rank all samples from --sampled-hours (default 24) by likes\n\nOptions:\n  --pages N       X API pages to fetch (default fetch/run: 6, following: 300)\n  --limit N       Candidate count (default: 40)\n  --hours N       Candidate lookback/fetch stop hours (default: 30)\n  --query Q       X search query for fetch-following (default: filter:follows)\n  --slice-minutes N  Time-slice width for exhaustive following search (default: 10)\n  --min-slice-minutes N  Smallest adaptive split window when a slice is still full (default: 1)\n  --pages-per-slice N  Search pages per time slice (default: 2)\n  --batch-hours N  Browser-evaluate batch size in hours (default: 1)\n  --candidate-hours N  Candidate lookback for run/run-following (default: --hours)\n  --sync-following-pages N  Page budget for manual current-following sync (default: 120)\n  --no-popular-refresh  Disable the min_faves backfill used by run-following-popular\n  --popular-refresh-min-faves N  Backfill threshold for viral posts that grew after initial ingest (default: 100)\n  --popular-refresh-pages N  Page budget for the popular backfill (default: 2 pages per candidate hour, min 60)\n  --exclude-active-source  Exclude posts from active twitter_feed subscriptions when ranking popular rows\n  --db PATH       SQLite DB path\n  --user-slug S   ClawFeed user slug (default: kevin)\n  --file PATH     Digest file for insert\n  --json          JSON output where supported`);
+  console.log(`Usage: scripts/clawfeed-x-pipeline.mjs <fetch|fetch-following|sync-following|sync-followers|candidates|popular|insert|run|run-following|run-following-popular|run-home-popular> [options]\n\nCommands:\n  fetch            Fetch X Home timeline via the logged-in OpenClaw browser session and store raw_items\n  fetch-following  Fetch latest tweets from all followed accounts via X search filter:follows\n  sync-following   Best-effort sync of ClawFeed twitter_feed sources to the logged-in X account's current Following list\n  sync-followers   Read-only: the logged-in account's followers with bio, location, follower count and verified flag, resumed across runs (--artifact PATH)\n  candidates       Print recent high-signal raw_items for a digest\n  insert           Insert a digest from stdin or --file into ClawFeed\n  run              Fetch Home timeline + print candidates (cron/agent composes the digest)\n  run-following    Fetch all-following timeline + print candidates\n  run-following-popular  Fetch live all-following tweets, then rank only rows refreshed by this run\n  run-home-popular  Fetch a For you (Home) sample, then rank all samples from --sampled-hours (default 24) by likes\n\nOptions:\n  --pages N       X API pages to fetch (default fetch/run: 6, following: 300)\n  --limit N       Candidate count (default: 40)\n  --hours N       Candidate lookback/fetch stop hours (default: 30)\n  --query Q       X search query for fetch-following (default: filter:follows)\n  --slice-minutes N  Time-slice width for exhaustive following search (default: 10)\n  --min-slice-minutes N  Smallest adaptive split window when a slice is still full (default: 1)\n  --pages-per-slice N  Search pages per time slice (default: 2)\n  --batch-hours N  Browser-evaluate batch size in hours (default: 1)\n  --candidate-hours N  Candidate lookback for run/run-following (default: --hours)\n  --sync-following-pages N  Page budget for manual current-following sync (default: 120)\n  --no-popular-refresh  Disable the min_faves backfill used by run-following-popular\n  --popular-refresh-min-faves N  Backfill threshold for viral posts that grew after initial ingest (default: 100)\n  --popular-refresh-pages N  Page budget for the popular backfill (default: 2 pages per candidate hour, min 60)\n  --exclude-active-source  Exclude posts from active twitter_feed subscriptions when ranking popular rows\n  --db PATH       SQLite DB path\n  --user-slug S   ClawFeed user slug (default: kevin)\n  --file PATH     Digest file for insert\n  --json          JSON output where supported`);
 }
 
 function getDb(dbPath = DEFAULT_DB) {
@@ -727,9 +728,13 @@ function makeFetchFollowingSearchFn({ pages, query, hours, sliceMinutes, minSlic
   }`;
 }
 
-function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
+function makeFetchFollowingListFn({ pages, startCursor, seedFollowing, operation = 'Following', ownerLookup = false }) {
+  // operation: 'Following' (default) or 'Followers'. Both keep each user's bio, location, follower count and
+  // verified flag (2026-11-24, for first-user scoring). ownerLookup also reads the account's own counts once (one load).
   return `async () => {
     const maxPages = ${Number(pages) || 120};
+    const OPERATION = ${JSON.stringify(operation === 'Followers' ? 'Followers' : 'Following')};
+    const OWNER_LOOKUP = ${ownerLookup ? 'true' : 'false'};
     const resumeCursor = ${JSON.stringify(startCursor || null)};
     const seedRows = ${JSON.stringify(seedFollowing || [])};
     const BEARER_FALLBACK = ${JSON.stringify(X_BEARER_FALLBACK)};
@@ -740,18 +745,21 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
 
     async function getClientConfig() {
       let bearer = BEARER_FALLBACK;
-      let followingQueryId = FOLLOWING_QUERY_ID_FALLBACK;
+      let followingQueryId = OPERATION === 'Following' ? FOLLOWING_QUERY_ID_FALLBACK : '';
+      let ownerQueryId = '';
       const mainSrc = Array.from(document.scripts).map(s => s.src).find(src => src.includes('/responsive-web/client-web/main.') && src.endsWith('.js'));
       if (mainSrc) {
         try {
           const js = await (await fetch(mainSrc, { credentials: 'omit' })).text();
           const b = js.match(/AAAAAAAAAAAAAAAAAAAAA[^"']+/);
           if (b) bearer = b[0];
-          const q = js.match(/queryId:"([^"]+)",operationName:"Following"/);
+          const q = js.match(new RegExp('queryId:"([^"]+)",operationName:"' + OPERATION + '"'));
           if (q) followingQueryId = q[1];
+          const o = js.match(/queryId:"([^"]+)",operationName:"UserByRestId"/);
+          if (o) ownerQueryId = o[1];
         } catch {}
       }
-      return { bearer, followingQueryId };
+      return { bearer, followingQueryId, ownerQueryId };
     }
 
     const features = {
@@ -805,12 +813,13 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
       withGrokAnalyze:false,
       withDisallowedReplyControls:true
     };
-    const { bearer, followingQueryId } = await getClientConfig();
+    const { bearer, followingQueryId, ownerQueryId } = await getClientConfig();
     const ct0 = (document.cookie.match(/(?:^|; )ct0=([^;]+)/)||[])[1] || '';
     const twid = decodeURIComponent((document.cookie.match(/(?:^|; )twid=([^;]+)/)||[])[1] || '');
     const userId = (twid.match(/u=(\\d+)/)||[])[1] || '';
     if (!ct0 || !userId) return { ok:false, error:'missing_x_login_cookie', following:[] };
-    const endpoint = 'https://x.com/i/api/graphql/' + followingQueryId + '/Following';
+    if (!followingQueryId) return { ok:false, error:'missing_query_id_' + OPERATION, following:[], operation:OPERATION };
+    const endpoint = 'https://x.com/i/api/graphql/' + followingQueryId + '/' + OPERATION;
     const headers = {
       authorization:'Bearer '+bearer,
       'x-csrf-token':ct0,
@@ -831,7 +840,11 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
         handle,
         screenName: String(row.screenName || row.handle || '').replace(/^@/, ''),
         name: row.name || row.screenName || '',
-        restId: row.restId || null
+        restId: row.restId || null,
+        bio: row.bio ?? null,
+        location: row.location ?? null,
+        followersCount: row.followersCount ?? null,
+        verified: row.verified ?? null
       });
     }
 
@@ -845,11 +858,17 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
       const screen = core.screen_name || legacy.screen_name;
       if (!screen) return;
       const handle = '@' + String(screen).replace(/^@/, '');
+      const loc = result.location && typeof result.location === 'object' ? result.location.location : null;
+      const counts = result.relationship_counts || {};
       users.set(handle.toLowerCase(), {
         handle,
         screenName: String(screen),
         name: core.name || legacy.name || screen,
-        restId: restId || null
+        restId: restId || null,
+        bio: legacy.description ?? (result.profile_bio && result.profile_bio.description) ?? null,
+        location: loc || legacy.location || null,
+        followersCount: Number.isFinite(legacy.followers_count) ? legacy.followers_count : (Number.isFinite(counts.followers) ? counts.followers : null),
+        verified: Boolean(result.is_blue_verified || (result.verification && result.verification.verified) || legacy.verified)
       });
     }
     function walk(o) {
@@ -857,6 +876,22 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
       if (o.user_results?.result) addUser(o.user_results.result);
       if (Array.isArray(o)) for (const v of o) walk(v);
       else for (const v of Object.values(o)) walk(v);
+    }
+
+    let owner = null;
+    if (OWNER_LOOKUP && ownerQueryId) {
+      try {
+        const ov = { userId, withSafetyModeUserFields: true };
+        const of = { hidden_profile_subscriptions_enabled:true, profile_label_improvements_pcf_label_in_post_enabled:true, rweb_tipjar_consumption_enabled:false, verified_phone_label_enabled:false, highlights_tweets_tab_ui_enabled:true, responsive_web_twitter_article_notes_tab_enabled:true, subscriptions_feature_can_gift_premium:true, creator_subscriptions_tweet_preview_api_enabled:true, responsive_web_graphql_skip_user_profile_image_extensions_enabled:false, responsive_web_graphql_timeline_navigation_enabled:true };
+        const ourl = 'https://x.com/i/api/graphql/' + ownerQueryId + '/UserByRestId?variables=' + encodeURIComponent(JSON.stringify(ov)) + '&features=' + encodeURIComponent(JSON.stringify(of));
+        const or = await fetch(ourl, { method:'GET', credentials:'include', headers });
+        if (or.status === 429) return { ok:false, rateLimited:true, status:429, error:'owner lookup 429', following:Array.from(users.values()), pages:pageSummaries, complete:false, operation:OPERATION };
+        if (or.ok) {
+          const ou = (await or.json())?.data?.user?.result || {};
+          const ol = ou.legacy || {};
+          owner = { followersCount: Number.isFinite(ol.followers_count) ? ol.followers_count : null, followingCount: Number.isFinite(ol.friends_count) ? ol.friends_count : null, at: new Date().toISOString() };
+        } else owner = { error: 'status ' + or.status };
+      } catch (e) { owner = { error: String(e && e.message || e).slice(0, 200) }; }
     }
 
     for (let page = 0; page < maxPages; page += 1) {
@@ -873,7 +908,7 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
         body: JSON.stringify({ variables, features, fieldToggles })
       });
       const text = await resp.text();
-      if (!resp.ok) return { ok:false, rateLimited:resp.status === 429, status:resp.status, error:text.slice(0,500), following:Array.from(users.values()), pages:pageSummaries, complete:false };
+      if (!resp.ok) return { ok:false, rateLimited:resp.status === 429, status:resp.status, error:text.slice(0,500), following:Array.from(users.values()), pages:pageSummaries, complete:false, operation:OPERATION, owner };
       const json = JSON.parse(text);
       const instructions = json?.data?.user?.result?.timeline?.timeline?.instructions || [];
       const entries = instructions.flatMap(i => i.entries || []);
@@ -891,7 +926,7 @@ function makeFetchFollowingListFn({ pages, startCursor, seedFollowing }) {
       cursor = bottom;
       await sleep(150);
     }
-    return { ok:true, endpoint, userId, count:users.size, pageBudget:maxPages, pages:pageSummaries, complete, following:Array.from(users.values()) };
+    return { ok:true, endpoint, userId, operation:OPERATION, owner, count:users.size, pageBudget:maxPages, pages:pageSummaries, complete, following:Array.from(users.values()) };
   }`;
 }
 
@@ -1120,10 +1155,13 @@ async function fetchFollowingList({ pages, resumeArtifact }) {
   if (!resumeArtifact) resumeArtifact = (process.env.CLAWFEED_FOLLOWING_RESUME_JSON || `${DEFAULT_DB}.following-partial.json`);
   try {
     const prior = JSON.parse(readFileSync(resumeArtifact, 'utf8'));
-    if (Array.isArray(prior.following) && prior.following.length) seedFollowing = prior.following;
-    const pagesArr = Array.isArray(prior.pages) ? prior.pages : [];
-    const last = pagesArr[pagesArr.length - 1];
-    if (last && last.cursor) startCursor = last.cursor;
+    // A finished pass is not resumed from its final cursor (that re-fetched the tail every night): start fresh.
+    if (prior.complete !== true) {
+      if (Array.isArray(prior.following) && prior.following.length) seedFollowing = prior.following;
+      const pagesArr = Array.isArray(prior.pages) ? prior.pages : [];
+      const last = pagesArr[pagesArr.length - 1];
+      if (last && last.cursor) startCursor = last.cursor;
+    }
   } catch { /* no prior partial to resume */ }
   const result = await evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget, startCursor, seedFollowing }), {
     timeoutMs: Math.max(120000, pageBudget * 2500),
@@ -1134,6 +1172,36 @@ async function fetchFollowingList({ pages, resumeArtifact }) {
   if (!result?.ok) throw new Error(`X following list fetch failed: ${JSON.stringify(result || {})}`);
   if (!result.complete) throw new Error(`X following list fetch did not complete within ${pageBudget} pages`);
   return result;
+}
+
+async function syncFollowersProfiles({ dbPath, pages, artifact }) {
+  // Followers of the logged-in account with their profile fields (2026-11-24, first-user scoring). Read-only: writes
+  // only its own artifact, resumes from its last cursor across nights, stops at the shared budget or a 429, and reads
+  // the account's own follower count once per pass.
+  artifact = artifact || `${dbPath || DEFAULT_DB}.followers-profiles.json`;
+  let prior = null;
+  try { prior = JSON.parse(readFileSync(artifact, 'utf8')); } catch { /* first pass */ }
+  if (prior && prior.complete === true) return { ok:true, complete:true, skipped:'already complete', count:(prior.users||[]).length, owner:prior.owner||null, artifact };
+  const seed = prior && Array.isArray(prior.users) ? prior.users : [];
+  const pagesArr = prior && Array.isArray(prior.pages) ? prior.pages : [];
+  const last = pagesArr[pagesArr.length - 1];
+  const startCursor = last && last.cursor ? last.cursor : null;
+  const ownerKnown = Boolean(prior && prior.owner && Number.isFinite(prior.owner.followersCount));
+  prepareOwnXTab();
+  const pageBudget = Number(pages) || 64;
+  const result = await evaluateOnX(makeFetchFollowingListFn({ pages: pageBudget, startCursor, seedFollowing: seed, operation: 'Followers', ownerLookup: !ownerKnown }), {
+    timeoutMs: Math.max(120000, pageBudget * 2500), maxBuffer: 128 * 1024 * 1024, label: 'followers profiles',
+  });
+  const owner = ownerKnown ? prior.owner : (result?.owner || (prior && prior.owner) || null);
+  const users = Array.isArray(result?.following) && result.following.length ? result.following : seed;
+  const newPages = Array.isArray(result?.pages) ? result.pages : [];
+  const complete = result?.ok === true && result.complete === true;
+  const out = { account:'bruceonbitcoin', operation:'Followers', complete, owner, observedAt:new Date().toISOString(),
+    budgetDenied:Boolean(result?.budgetDenied), rateLimited:Boolean(result?.rateLimited), error:result?.ok ? null : (result?.error || 'incomplete'),
+    pages:[...pagesArr, ...newPages].slice(-200), users };
+  writeFileSync(artifact+'.tmp',JSON.stringify(out,null,2)+'\n',{mode:0o600});
+  renameSync(artifact+'.tmp',artifact);
+  return { ok:Boolean(result?.ok), complete, budgetDenied:out.budgetDenied, rateLimited:out.rateLimited, count:users.length, added:newPages.length ? users.length - seed.length : 0, owner, artifact, error:out.error };
 }
 
 async function syncFollowingSources({ dbPath, userSlug, pages }) {
@@ -1148,6 +1216,11 @@ async function syncFollowingSources({ dbPath, userSlug, pages }) {
     writeFileSync(artifact+'.tmp',JSON.stringify({...result,complete:false,observedAt:new Date().toISOString()},null,2)+'\n',{mode:0o600});
     renameSync(artifact+'.tmp',artifact);
     return {ok:false,complete:false,budgetDenied:Boolean(result.budgetDenied),fetched:result.following?.length||0,artifact,error:result.error||'Incomplete following coverage; subscriptions unchanged'};
+  }
+  {
+    const artifact = `${dbPath || DEFAULT_DB}.following-partial.json`;
+    writeFileSync(artifact+'.tmp',JSON.stringify({...result,complete:true,observedAt:new Date().toISOString()},null,2)+'\n',{mode:0o600});
+    renameSync(artifact+'.tmp',artifact);
   }
   const latestByHandle = new Map();
   for (const account of result.following || []) {
@@ -1524,6 +1597,9 @@ try {
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'sync-following') {
     const out = await syncFollowingSources({ ...common, pages: args.syncFollowingPages || args.pages || 120 });
+    console.log(JSON.stringify(out, null, 2));
+  } else if (cmd === 'sync-followers') {
+    const out = await syncFollowersProfiles({ ...common, pages: args.pages || 64, artifact: args.artifact });
     console.log(JSON.stringify(out, null, 2));
   } else if (cmd === 'candidates') {
     printCandidates(candidateRows({ ...common, limit: args.limit || 40, hours: args.candidateHours || args.hours || 30 }), args.json);
